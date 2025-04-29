@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package mini3;
+
+import "google/protobuf/empty.proto";
+
+// PeerInfo carries one node’s score + hop count
+message PeerInfo {
+  string node_id = 1;
+  double score   = 2;
+  int32  hops    = 3;
+}
+
+// Heartbeat: sent every 500 ms
+message Heartbeat {
+  string           from     = 1;
+  double           my_score = 2;
+  repeated PeerInfo gossip  = 3;
+}
+
+// TaskRequest: client → server (or forwarder)
+message TaskRequest {
+  string task_id  = 1;
+  string payload  = 2;
+  string reply_to = 3;
+}
+
+// TaskResponse: processing node → client
+message TaskResponse {
+  string task_id = 1;
+  string result  = 2;
+}
+
+// The service with two RPCs
+service Mini3Service {
+  rpc SendHeartbeat(Heartbeat)      returns (google.protobuf.Empty);
+  rpc SubmitTask  (TaskRequest)     returns (TaskResponse);
+}

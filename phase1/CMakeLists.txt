@@ -32,6 +32,7 @@ file(GLOB PROTO_SRCS
 # Your server binary
 add_executable(server
   src/main.cpp
+  src/server.cpp
   ${PROTO_SRCS}
 )
 

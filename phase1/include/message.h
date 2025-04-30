@@ -2,8 +2,8 @@
 #define MESSAGE_H
 
 #include <string>
-#include "generated/mini3.pb.h"
-#include "generated/mini3.grpc.pb.h"
+#include "mini3.pb.h"
+#include "mini3.grpc.pb.h"
 
 enum class MessageType {
     HEARTBEAT,

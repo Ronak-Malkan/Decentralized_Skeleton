@@ -1,0 +1,4 @@
+# Ignore the build directory in phase1
+phase1/build/
+phase1/generated/
+phase1/.vscode/

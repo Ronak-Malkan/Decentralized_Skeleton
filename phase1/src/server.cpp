@@ -1,5 +1,5 @@
 #include "server.h"
-#include <iostream>
+#include "logger.h"
 #include <chrono>
 #include <thread>
 
@@ -32,45 +32,47 @@ void Server::shutdown() {
 }
 
 void Server::listenerLoop() {
-    std::cout << "["<< node_id_ <<"] Listener thread started\n";
+    log_line("[" + node_id_ + "] Listener thread started");
     while (running_) {
-        // TODO: block on gRPC server->Wait() or async queue → wrap in Message → inbound_.push()
+        // TODO: block on gRPC server → wrap in Message → inbound_.push()
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    std::cout << "["<< node_id_ <<"] Listener thread exiting\n";
+    log_line("[" + node_id_ + "] Listener thread exiting");
 }
 
 void Server::processorLoop() {
-    std::cout << "["<< node_id_ <<"] Processor thread started\n";
+    log_line("[" + node_id_ + "] Processor thread started");
     while (running_) {
         // Block until a Message arrives
         Message msg = inbound_.wait_and_pop();
         // TODO: demux on msg.type → updatePeerInfo(msg) or processLocal/forward(msg)
-        std::cout << "["<< node_id_ <<"] Processor got a message of type "
-                  << (msg.type == MessageType::HEARTBEAT ? "HEARTBEAT" : "TASK_REQUEST")
-                  << " from " << msg.from << "\n";
+        std::string type_str = (msg.type == MessageType::HEARTBEAT
+                                ? "HEARTBEAT"
+                                : "TASK_REQUEST");
+        log_line("[" + node_id_ + "] Processor got a message of type "
+                 + type_str + " from " + msg.from);
     }
-    std::cout << "["<< node_id_ <<"] Processor thread exiting\n";
+    log_line("[" + node_id_ + "] Processor thread exiting");
 }
 
 void Server::heartbeatLoop() {
-    std::cout << "["<< node_id_ <<"] Heartbeat thread started\n";
+    log_line("[" + node_id_ + "] Heartbeat thread started");
     while (running_) {
         // TODO: sample metrics, compute score, build Heartbeat proto,
         //       send via gRPC stubs to neighbors_
-        std::cout << "["<< node_id_ <<"] Sending heartbeat to " 
-                  << neighbors_.size() << " neighbors\n";
+        log_line("[" + node_id_ + "] Sending heartbeat to "
+                 + std::to_string(neighbors_.size()) + " neighbors");
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    std::cout << "["<< node_id_ <<"] Heartbeat thread exiting\n";
+    log_line("[" + node_id_ + "] Heartbeat thread exiting");
 }
 
 void Server::routingLoop() {
-    std::cout << "["<< node_id_ <<"] Routing thread started\n";
+    log_line("[" + node_id_ + "] Routing thread started");
     while (running_) {
         // TODO: walk peerInfo → rebuild nextHop routing table
-        std::cout << "["<< node_id_ <<"] Rebuilding routing table\n";
+        log_line("[" + node_id_ + "] Rebuilding routing table");
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    std::cout << "["<< node_id_ <<"] Routing thread exiting\n";
+    log_line("[" + node_id_ + "] Routing thread exiting");
 }

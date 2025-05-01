@@ -1,3 +1,4 @@
+
 #include "server.h"
 #include "thread_safe_queue.h"
 #include "file_logger.h"
@@ -6,52 +7,54 @@
 #include <grpcpp/server_context.h>
 #include <grpcpp/client_context.h>
 #include <grpcpp/create_channel.h>
+#include <grpcpp/support/status.h>
 #include <google/protobuf/empty.pb.h>
 #include "mini3.grpc.pb.h"
 
 #include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <thread>
 #include <algorithm>
 #include <random>
+#include <vector>
+#include <utility>
+#include <string>
+#include <filesystem>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
 #include <mach/vm_statistics.h>
-#include <filesystem>
 
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::ClientContext;
 using grpc::Status;
+using grpc::StatusCode;
 using google::protobuf::Empty;
 using namespace mini3;
 
-//------------------------------------------------------------------------------
-// Helper: on macOS, read total vs free+inactive RAM → [0..1]
 static double getMemoryFreeFraction() {
 #ifdef __APPLE__
-    // total RAM
     uint64_t mem_total = 0;
     size_t len = sizeof(mem_total);
-    if (sysctlbyname("hw.memsize", &mem_total, &len, nullptr, 0) != 0)
+    if (sysctlbyname("hw.memsize", &mem_total, &len, nullptr, 0) != 0) {
         return 0.5;
-    // VM stats
+    }
     mach_msg_type_number_t count = HOST_VM_INFO_COUNT;
     vm_statistics_data_t vmstat;
     if (host_statistics(mach_host_self(),
                         HOST_VM_INFO,
                         reinterpret_cast<host_info_t>(&vmstat),
-                        &count) != KERN_SUCCESS)
+                        &count) != KERN_SUCCESS) {
         return 0.5;
-    // convert pages → bytes
+    }
     uint64_t free_bytes = uint64_t(vmstat.free_count + vmstat.inactive_count)
                           * uint64_t(sysconf(_SC_PAGESIZE));
     return std::clamp(double(free_bytes) / double(mem_total), 0.0, 1.0);
 #else
-    // fallback or implement Linux sysinfo() here
     return 0.5;
 #endif
 }
@@ -142,6 +145,7 @@ Server::~Server() {
     shutdown();
 }
 
+
 //------------------------------------------------------------------------------
 // run / shutdown
 void Server::run() {
@@ -188,80 +192,86 @@ void Server::listenerLoop() {
             return Status::OK;
         }
 
-        Status SubmitTask(ServerContext* ctx,
+        Status SubmitTask(ServerContext*,
                           const TaskRequest* req,
-                          TaskResponse*    resp) override
+                          TaskResponse*      resp) override
         {
             log_.log("task_request_received", {{"task", req->task_id()}});
 
-            // score ourselves and log all
-            double myScore = srv_->computeScore();
-            double bestScore = myScore;
-            std::string bestId = srv_->node_id_;
-
-            nlohmann::json arr = nlohmann::json::array();
-            arr.push_back({{"node", srv_->node_id_}, {"score", myScore}});
-            for (auto& [id, entry] : srv_->peer_info_) {
-                arr.push_back({{"node", id}, {"score", entry.score}});
-            }
-            srv_->logger_->log("all_scores", {{"scores", std::move(arr)}});
-
-            // pick best
+            // Build sorted candidate list
+            std::vector<std::pair<std::string,double>> candidates;
+            candidates.emplace_back(
+                srv_->node_id_, srv_->computeScore()
+            );
             for (auto& [id,e] : srv_->peer_info_) {
-                if (e.score > bestScore) {
-                    bestScore = e.score;
-                    bestId    = id;
+                candidates.emplace_back(id, e.score);
+            }
+            std::sort(candidates.begin(),
+                      candidates.end(),
+                      [](auto &a, auto &b){ return a.second > b.second; });
+
+            // Try each candidate in order
+            for (auto& [id,score] : candidates) {
+                if (id == srv_->node_id_) {
+                    srv_->processLocalSync(*req, resp);
+                    return Status::OK;
                 }
-            }
+                // forward
+                auto viaIt = srv_->next_hop_.find(id);
+                if (viaIt == srv_->next_hop_.end()) continue;
+                auto via = viaIt->second;
+                auto it = std::find(
+                    srv_->stub_addrs_.begin(),
+                    srv_->stub_addrs_.end(),
+                    via
+                );
+                if (it == srv_->stub_addrs_.end()) continue;
+                size_t idx = std::distance(
+                    srv_->stub_addrs_.begin(), it
+                );
 
-            // local vs forward
-            if (bestId == srv_->node_id_) {
-                srv_->processLocalSync(*req, resp);
-                return Status::OK;
-            }
-
-            auto viaIt = srv_->next_hop_.find(bestId);
-            if (viaIt == srv_->next_hop_.end()) {
-                log_.log("task_drop", {{"task", req->task_id()}});
-                return Status::CANCELLED;
-            }
-            auto via = viaIt->second;
-            auto it = std::find(srv_->stub_addrs_.begin(),
-                                srv_->stub_addrs_.end(),
-                                via);
-            if (it == srv_->stub_addrs_.end()) {
-                log_.log("task_drop", {{"task", req->task_id()}});
-                return Status::CANCELLED;
-            }
-            size_t idx = std::distance(srv_->stub_addrs_.begin(), it);
-
-            ClientContext fwd_ctx;
-            fwd_ctx.set_deadline(
-              std::chrono::system_clock::now() + std::chrono::seconds(5));
-            Status s = srv_->stubs_[idx]->SubmitTask(&fwd_ctx, *req, resp);
-            if (s.ok()) {
-                log_.log("task_forward_ok", {
-                    {"task", req->task_id()},
-                    {"responder", resp->result()}
-                });
-            } else {
+                ClientContext fwd_ctx;
+                fwd_ctx.set_deadline(
+                    std::chrono::system_clock::now()
+                  + std::chrono::seconds(5)
+                );
+                TaskResponse tmp;
+                Status s = srv_->stubs_[idx]->SubmitTask(
+                    &fwd_ctx, *req, &tmp
+                );
+                if (s.ok()) {
+                    *resp = tmp;
+                    log_.log("task_forward_ok", {
+                        {"task",      req->task_id()},
+                        {"responder", tmp.result()}
+                    });
+                    return Status::OK;
+                }
                 log_.log("task_forward_fail", {
-                    {"task",  req->task_id()},
+                    {"task", req->task_id()},
+                    {"to",    via},
                     {"error", s.error_message()}
                 });
             }
-            return s;
+
+            log_.log("task_drop", {{"task", req->task_id()}});
+            return Status(
+                StatusCode::INTERNAL,
+                "all forwarding attempts failed"
+            );
         }
     };
 
     ServiceImpl service(this);
     ServerBuilder builder;
-    builder.AddListeningPort(listen_addr_,
-                             grpc::InsecureServerCredentials());
+    builder.AddListeningPort(
+        listen_addr_,
+        grpc::InsecureServerCredentials()
+    );
     builder.RegisterService(&service);
     grpc_server_ = builder.BuildAndStart();
     logger_->log("grpc_listening", {{"addr", listen_addr_}});
-    grpc_server_->Wait();  // block here until shutdown()
+    grpc_server_->Wait();
 }
 
 //------------------------------------------------------------------------------
@@ -279,7 +289,7 @@ void Server::updatePeerInfo(const Heartbeat& hb,
                             const std::string& sender)
 {
     auto now = std::chrono::steady_clock::now();
-    peer_info_[sender] = PeerEntry{hb.my_score(), sender, 0, now};
+    peer_info_[sender] = PeerEntry{hb.my_score(), sender, 1, now};
     for (auto& pi : hb.gossip()) {
         int nh = pi.hops() + 1;
         auto it = peer_info_.find(pi.node_id());
@@ -319,6 +329,15 @@ void Server::heartbeatLoop() {
         Heartbeat hb;
         hb.set_from(node_id_);
         hb.set_my_score(score);
+
+        for (auto& [peer_id,entry] : peer_info_) {
+            if (entry.hops <= 3) {
+                auto* pi = hb.add_gossip();
+                pi->set_node_id(peer_id);
+                pi->set_score(entry.score);
+                pi->set_hops(entry.hops);
+            }
+        }
 
         logger_->log("heartbeat_sent", {
             {"score", score},

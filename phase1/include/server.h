@@ -1,96 +1,97 @@
-// server.h
-#ifndef MINI3_SERVER_H
-#define MINI3_SERVER_H
+#pragma once
 
-#include <grpcpp/server.h>
-#include <grpcpp/server_builder.h>
-#include <grpcpp/client_context.h>
-#include <grpcpp/create_channel.h>
-
-#include "mini3.grpc.pb.h"
-#include "thread_safe_queue.h"
-#include "file_logger.h"
-
-#include <map>
 #include <string>
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <fstream>
+#include <memory>
+#include <unordered_map>
 #include <chrono>
 #include <filesystem>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <fstream>
 
-constexpr size_t MAX_QUEUE = 1000;
+#include "thread_safe_queue.h"   // your queue, now only used for heartbeats
+#include "file_logger.h"         // FileLogger
+#include "mini3.grpc.pb.h"       // generated gRPC + protobuf
 
-enum class MessageType { HEARTBEAT, TASK_REQUEST };
-
-struct Message {
-  MessageType type;
-  std::string from;
-  mini3::Heartbeat heartbeat;
-  mini3::TaskRequest task_request;
-};
+// Maximum queue length for score computation
+static constexpr size_t MAX_QUEUE = 1024;
 
 struct PeerEntry {
-  double score;
-  std::string via;
-  int hops;
+  double                              score;
+  std::string                         via;
+  int                                 hops;
   std::chrono::steady_clock::time_point last_seen;
 };
 
-class Server final {
+class Server {
 public:
   Server(std::string node_id,
          std::string listen_addr,
          std::vector<std::string> neighbors);
+  ~Server();
 
-  // start all threads and gRPC server
+  // Starts all the threads and blocks on the gRPC server
   void run();
-
-  // initiate shutdown
   void shutdown();
 
 private:
-  // per‐thread loops
+  // gRPC listener (for both heartbeat & task RPCs)
   void listenerLoop();
+
+  // Only processes heartbeats from the queue
   void processorLoop();
+
+  // Periodically send heartbeats to neighbors
   void heartbeatLoop();
+
+  // Prune stale peers and rebuild next_hop_ map
   void routingLoop();
+
+  // Dump metrics once a second
   void metricsLoop();
 
-  // internal helpers
-  void updatePeerInfo(const mini3::Heartbeat& hb, const std::string& sender);
-  void processLocal(const Message& msg);
-  void forwardTask(const Message& msg);
+  // Score computation from load, queue, uptime...
   double computeScore();
 
-  // identity & network
-  std::string node_id_;
-  std::string listen_addr_;
-  std::vector<std::string> neighbors_;
+  // Update peer_info_ from an incoming heartbeat
+  void updatePeerInfo(const mini3::Heartbeat& hb,
+                      const std::string& sender);
 
-  // gRPC stubs
+  // Called when we decide to handle a task locally (sync path)
+  void processLocalSync(const mini3::TaskRequest& req,
+                        mini3::TaskResponse* resp);
+
+  // Configuration / state
+  const std::string                          node_id_;
+  const std::string                          listen_addr_;
+  const std::vector<std::string>             neighbors_;
+
+  // one stub per neighbor
   std::vector<std::unique_ptr<mini3::Mini3Service::Stub>> stubs_;
-  std::vector<std::string> stub_addrs_;
-  std::unique_ptr<grpc::Server> grpc_server_;
+  std::vector<std::string>                    stub_addrs_;
 
-  // incoming message queue
-  ThreadSafeQueue<Message> inbound_;
+  // Logging + queue for heartbeats only
+  std::unique_ptr<FileLogger>                 logger_;
+  ThreadSafeQueue<mini3::Heartbeat>           hb_queue_;
 
-  // peer state, protected by peers_mtx_
-  std::mutex peers_mtx_;
-  std::map<std::string, PeerEntry> peer_info_;
-  std::map<std::string, std::string>  next_hop_;
+  // Peer table + routing
+  std::unordered_map<std::string,PeerEntry>   peer_info_;
+  std::unordered_map<std::string,std::string> next_hop_;
 
-  // threads and control flag
-  std::thread t_listener_, t_processor_, t_heartbeat_, t_routing_, t_metrics_;
-  std::atomic<bool> running_{false};
+  // gRPC server handle
+  std::shared_ptr<grpc::Server>               grpc_server_;
 
-  // logging & metrics
-  std::unique_ptr<FileLogger> logger_;
-  std::ofstream metrics_file_;
-  std::mutex metrics_mtx_;
+  // Threads
+  std::atomic<bool>                           running_{false};
+  std::thread                                 t_listener_,
+                                              t_processor_,
+                                              t_heartbeat_,
+                                              t_routing_,
+                                              t_metrics_;
+
+  // Metrics file
+  std::mutex                                  metrics_mtx_;
+  std::ofstream                               metrics_file_;
 };
-
-#endif // MINI3_SERVER_H

@@ -1,6 +1,6 @@
-// src/server.cpp
-
 #include "server.h"
+#include "thread_safe_queue.h"
+#include "file_logger.h"
 
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
@@ -12,23 +12,99 @@
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <thread>
-#include <string>
 #include <algorithm>
-#include <cstdlib>
+#include <random>
+#include <unistd.h>
+#include <sys/types.h>
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/vm_statistics.h>
 #include <filesystem>
 
 using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::ClientContext;
 using grpc::Status;
-using mini3::Heartbeat;
-using mini3::Mini3Service;
-using mini3::TaskRequest;
-using mini3::TaskResponse;
 using google::protobuf::Empty;
+using namespace mini3;
 
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Helper: on macOS, read total vs free+inactive RAM → [0..1]
+static double getMemoryFreeFraction() {
+#ifdef __APPLE__
+    // total RAM
+    uint64_t mem_total = 0;
+    size_t len = sizeof(mem_total);
+    if (sysctlbyname("hw.memsize", &mem_total, &len, nullptr, 0) != 0)
+        return 0.5;
+    // VM stats
+    mach_msg_type_number_t count = HOST_VM_INFO_COUNT;
+    vm_statistics_data_t vmstat;
+    if (host_statistics(mach_host_self(),
+                        HOST_VM_INFO,
+                        reinterpret_cast<host_info_t>(&vmstat),
+                        &count) != KERN_SUCCESS)
+        return 0.5;
+    // convert pages → bytes
+    uint64_t free_bytes = uint64_t(vmstat.free_count + vmstat.inactive_count)
+                          * uint64_t(sysconf(_SC_PAGESIZE));
+    return std::clamp(double(free_bytes) / double(mem_total), 0.0, 1.0);
+#else
+    // fallback or implement Linux sysinfo() here
+    return 0.5;
+#endif
+}
+
+//------------------------------------------------------------------------------
+// Score = 40% CPU-free + 30% queue-depth + 20% mem-free + 10% uptime, plus jitter
+double Server::computeScore() {
+    // --- CPU free ---
+    double load = 0.0;
+    if (getloadavg(&load, 1) != -1) {
+        unsigned cores = std::thread::hardware_concurrency();
+        double busy = std::min(load / double(cores), 1.0);
+        load = 1.0 - busy;
+    } else {
+        load = 0.5;
+    }
+
+    // --- Memory free ---
+    double mem_free = getMemoryFreeFraction();
+
+    // --- Heartbeat‐queue depth fraction (older heartbeats pending) ---
+    double qlen = double(hb_queue_.size());
+    double q_frac = 1.0 - std::min(qlen, double(MAX_QUEUE)) / double(MAX_QUEUE);
+
+    // --- Uptime fraction ---
+    double up_frac = 0.0;
+    {
+#ifdef __APPLE__
+        struct timeval boottime{};
+        size_t sz = sizeof(boottime);
+        if (sysctlbyname("kern.boottime", &boottime, &sz, nullptr, 0) == 0) {
+            auto now = std::chrono::system_clock::now();
+            auto boot = std::chrono::system_clock::from_time_t(boottime.tv_sec);
+            double secs = std::chrono::duration<double>(now - boot).count();
+            up_frac = std::min(secs, 86400.0) / 86400.0;
+        }
+#endif
+    }
+
+    double base =
+         0.40 * load
+       + 0.30 * q_frac
+       + 0.20 * mem_free
+       + 0.10 * up_frac;
+
+    // jitter ±0.005 to avoid ties
+    static thread_local std::mt19937_64 gen{std::random_device{}()};
+    std::uniform_real_distribution<double> jitter(-0.005, +0.005);
+    return base + jitter(gen);
+}
+
+//------------------------------------------------------------------------------
+// Constructor / Destructor
 Server::Server(std::string node_id,
                std::string listen_addr,
                std::vector<std::string> neighbors)
@@ -48,51 +124,26 @@ Server::Server(std::string node_id,
         logger_->log("metrics_started");
     }
 
-    // Build one stub per neighbor (skip self)
     for (auto& addr : neighbors_) {
         if (addr == listen_addr_) {
             logger_->log("skip_neighbor_self", {{"addr", addr}});
             continue;
         }
-        auto channel = grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
-        stubs_.push_back(Mini3Service::NewStub(channel));
+        auto channel = grpc::CreateChannel(addr,
+                                           grpc::InsecureChannelCredentials());
+        stubs_.emplace_back(Mini3Service::NewStub(channel));
         stub_addrs_.push_back(addr);
     }
     logger_->log("neighbors_count", {{"neighbors", neighbors_.size()}});
     logger_->log("stubs_count",     {{"stubs",     stub_addrs_.size()}});
 }
 
-//----------------------------------------------------------------------------
-double Server::computeScore() {
-    double load = 0.0;
-    if (getloadavg(&load,1) != -1) {
-        unsigned cores = std::thread::hardware_concurrency();
-        double usage = cores ? (load/cores) : load;
-        usage = std::clamp(usage, 0.0, (double)cores);
-        load = (1.0 - usage/cores) * 100.0;
-    } else {
-        load = 50.0;
-    }
-
-    double mem_free_pct = 50.0;
-    struct timeval boottime; size_t len = sizeof(boottime);
-    if (sysctlbyname("kern.boottime",&boottime,&len,nullptr,0) != 0) {
-        boottime.tv_sec = 0;
-    }
-    auto now_sys = std::chrono::system_clock::now();
-    auto boot = std::chrono::system_clock::from_time_t(boottime.tv_sec);
-    double uptime = std::chrono::duration<double>(now_sys - boot).count();
-
-    double q_len = static_cast<double>(inbound_.size());
-    double x1 = 1.0 - std::min(q_len, (double)MAX_QUEUE) / MAX_QUEUE;
-
-    return 0.5*(load/100.0)
-         + 0.2*x1
-         + 0.2*(mem_free_pct/100.0)
-         + 0.1*(std::min(uptime,86400.0)/86400.0);
+Server::~Server() {
+    shutdown();
 }
 
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// run / shutdown
 void Server::run() {
     running_ = true;
     logger_->log("threads_starting");
@@ -110,86 +161,123 @@ void Server::run() {
     t_metrics_.join();
 }
 
-//----------------------------------------------------------------------------
 void Server::shutdown() {
     running_ = false;
     if (grpc_server_) grpc_server_->Shutdown();
     logger_->log("server_shutdown");
 }
 
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// listenerLoop: synchronous SubmitTask + heartbeats→queue
 void Server::listenerLoop() {
     logger_->log("thread_started", {{"thread","listener"}});
 
-    // Our RPC service, with synchronous SubmitTask
     class ServiceImpl final : public Mini3Service::Service {
-        ThreadSafeQueue<Message>& queue_;
-        FileLogger&              logger_;
-        const std::string&       node_id_;
+        Server* srv_;
+        FileLogger& log_;
     public:
-        ServiceImpl(ThreadSafeQueue<Message>& q,
-                    FileLogger& log,
-                    const std::string& nid)
-          : queue_(q), logger_(log), node_id_(nid) {}
+        explicit ServiceImpl(Server* s)
+          : srv_(s), log_(*s->logger_) {}
 
         Status SendHeartbeat(ServerContext*, const Heartbeat* req, Empty*) override {
-            logger_.log("heartbeat_received", {
+            log_.log("heartbeat_received", {
                 {"from", req->from()},
                 {"gossip_size", req->gossip_size()}
             });
-            Message m{MessageType::HEARTBEAT, req->from(), *req, {}};
-            queue_.push(std::move(m));
+            srv_->hb_queue_.push(*req);
             return Status::OK;
         }
 
-        // Handle TaskRequest synchronously and reply immediately
-        Status SubmitTask(ServerContext*,
+        Status SubmitTask(ServerContext* ctx,
                           const TaskRequest* req,
-                          TaskResponse* resp) override {
-            logger_.log("task_start", {{"task", req->task_id()}});
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            resp->set_task_id(req->task_id());
-            resp->set_result("Processed by " + node_id_);
-            logger_.log("task_complete", {{"task", req->task_id()}});
-            return Status::OK;
+                          TaskResponse*    resp) override
+        {
+            log_.log("task_request_received", {{"task", req->task_id()}});
+
+            // score ourselves and log all
+            double myScore = srv_->computeScore();
+            double bestScore = myScore;
+            std::string bestId = srv_->node_id_;
+
+            nlohmann::json arr = nlohmann::json::array();
+            arr.push_back({{"node", srv_->node_id_}, {"score", myScore}});
+            for (auto& [id, entry] : srv_->peer_info_) {
+                arr.push_back({{"node", id}, {"score", entry.score}});
+            }
+            srv_->logger_->log("all_scores", {{"scores", std::move(arr)}});
+
+            // pick best
+            for (auto& [id,e] : srv_->peer_info_) {
+                if (e.score > bestScore) {
+                    bestScore = e.score;
+                    bestId    = id;
+                }
+            }
+
+            // local vs forward
+            if (bestId == srv_->node_id_) {
+                srv_->processLocalSync(*req, resp);
+                return Status::OK;
+            }
+
+            auto viaIt = srv_->next_hop_.find(bestId);
+            if (viaIt == srv_->next_hop_.end()) {
+                log_.log("task_drop", {{"task", req->task_id()}});
+                return Status::CANCELLED;
+            }
+            auto via = viaIt->second;
+            auto it = std::find(srv_->stub_addrs_.begin(),
+                                srv_->stub_addrs_.end(),
+                                via);
+            if (it == srv_->stub_addrs_.end()) {
+                log_.log("task_drop", {{"task", req->task_id()}});
+                return Status::CANCELLED;
+            }
+            size_t idx = std::distance(srv_->stub_addrs_.begin(), it);
+
+            ClientContext fwd_ctx;
+            fwd_ctx.set_deadline(
+              std::chrono::system_clock::now() + std::chrono::seconds(5));
+            Status s = srv_->stubs_[idx]->SubmitTask(&fwd_ctx, *req, resp);
+            if (s.ok()) {
+                log_.log("task_forward_ok", {
+                    {"task", req->task_id()},
+                    {"responder", resp->result()}
+                });
+            } else {
+                log_.log("task_forward_fail", {
+                    {"task",  req->task_id()},
+                    {"error", s.error_message()}
+                });
+            }
+            return s;
         }
     };
 
-    // Instantiate service with our node_id_
-    ServiceImpl service{inbound_, *logger_, node_id_};
-
+    ServiceImpl service(this);
     ServerBuilder builder;
-    builder.AddListeningPort(listen_addr_, grpc::InsecureServerCredentials());
+    builder.AddListeningPort(listen_addr_,
+                             grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
     grpc_server_ = builder.BuildAndStart();
-
     logger_->log("grpc_listening", {{"addr", listen_addr_}});
-    grpc_server_->Wait();
+    grpc_server_->Wait();  // block here until shutdown()
 }
 
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// processorLoop: only heartbeats → peer_info_
 void Server::processorLoop() {
     logger_->log("thread_started", {{"thread","processor"}});
     while (running_) {
-        Message msg = inbound_.wait_and_pop();
-        if (msg.type == MessageType::HEARTBEAT) {
-            updatePeerInfo(msg.heartbeat, msg.from);
-        } else {
-            double myScore = computeScore();
-            double bestScore = myScore;
-            for (auto& [id,e] : peer_info_)
-                bestScore = std::max(bestScore, e.score);
-
-            if (myScore >= bestScore) processLocal(msg);
-            else                     forwardTask(msg);
-        }
+        auto hb = hb_queue_.wait_and_pop();
+        updatePeerInfo(hb, hb.from());
     }
     logger_->log("thread_exiting", {{"thread","processor"}});
 }
 
-//----------------------------------------------------------------------------
 void Server::updatePeerInfo(const Heartbeat& hb,
-                            const std::string& sender) {
+                            const std::string& sender)
+{
     auto now = std::chrono::steady_clock::now();
     peer_info_[sender] = PeerEntry{hb.my_score(), sender, 0, now};
     for (auto& pi : hb.gossip()) {
@@ -199,7 +287,8 @@ void Server::updatePeerInfo(const Heartbeat& hb,
                 || nh < it->second.hops
                 || (nh == it->second.hops && pi.score() > it->second.score);
         if (upd) {
-            peer_info_[pi.node_id()] = PeerEntry{pi.score(), sender, nh, now};
+            peer_info_[pi.node_id()] = PeerEntry{pi.score(),
+                                                 sender, nh, now};
         }
     }
     logger_->log("peer_update", {
@@ -208,17 +297,19 @@ void Server::updatePeerInfo(const Heartbeat& hb,
     });
 }
 
-//----------------------------------------------------------------------------
-void Server::processLocal(const Message& msg) {
-    // (unused under synchronous SubmitTask)
+//------------------------------------------------------------------------------
+// Local work
+void Server::processLocalSync(const TaskRequest& req,
+                              TaskResponse*    resp)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    resp->set_task_id(req.task_id());
+    resp->set_result("Processed by " + node_id_);
+    logger_->log("task_complete", {{"task", req.task_id()}});
 }
 
-//----------------------------------------------------------------------------
-void Server::forwardTask(const Message& msg) {
-    // (unused under synchronous SubmitTask)
-}
-
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// heartbeatLoop
 void Server::heartbeatLoop() {
     logger_->log("thread_started", {{"thread","heartbeat"}});
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -228,23 +319,26 @@ void Server::heartbeatLoop() {
         Heartbeat hb;
         hb.set_from(node_id_);
         hb.set_my_score(score);
+
         logger_->log("heartbeat_sent", {
             {"score", score},
             {"gossip_size", hb.gossip_size()}
         });
 
         for (size_t i = 0; i < stubs_.size(); ++i) {
+            auto stub = stubs_[i].get();
             auto addr = stub_addrs_[i];
-            std::thread([this, i, addr, hb]() {
+            Heartbeat copy = hb;
+            std::thread([stub, addr, copy, logger = logger_.get()]() mutable {
                 ClientContext ctx;
                 ctx.set_wait_for_ready(true);
                 Empty rep;
-                Status s = stubs_[i]->SendHeartbeat(&ctx, hb, &rep);
+                Status s = stub->SendHeartbeat(&ctx, copy, &rep);
                 if (s.ok()) {
-                    logger_->log("heartbeat_ok", {{"to", addr}});
+                    logger->log("heartbeat_ok", {{"to", addr}});
                 } else {
-                    logger_->log("heartbeat_fail", {
-                        {"to",    addr},
+                    logger->log("heartbeat_fail", {
+                        {"to", addr},
                         {"error", s.error_message()}
                     });
                 }
@@ -256,7 +350,8 @@ void Server::heartbeatLoop() {
     logger_->log("thread_exiting", {{"thread","heartbeat"}});
 }
 
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// routingLoop
 void Server::routingLoop() {
     logger_->log("thread_started", {{"thread","routing"}});
     while (running_) {
@@ -267,8 +362,11 @@ void Server::routingLoop() {
             if (age > 1500) {
                 logger_->log("peer_pruned", {{"peer", it->first}});
                 it = peer_info_.erase(it);
-            } else ++it;
+            } else {
+                ++it;
+            }
         }
+
         next_hop_.clear();
         for (auto& [id,e] : peer_info_) {
             next_hop_[id] = e.via;
@@ -276,46 +374,47 @@ void Server::routingLoop() {
         logger_->log("routing_rebuilt", {
             {"entries", next_hop_.size()}
         });
+
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     logger_->log("thread_exiting", {{"thread","routing"}});
 }
 
-//----------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// metricsLoop
 void Server::metricsLoop() {
     logger_->log("thread_started", {{"thread","metrics"}});
     while (running_) {
         double load = 0.0;
         if (getloadavg(&load,1) != -1) {
-            unsigned cores = std::thread::hardware_concurrency();
-            double usage = cores ? (load/cores) : load;
-            usage = std::clamp(usage, 0.0, (double)cores);
-            load = (1.0 - usage/cores)*100.0;
+            unsigned c = std::thread::hardware_concurrency();
+            double u = std::min(load/double(c), 1.0);
+            load = (1.0 - u) * 100.0;
         }
-        double mem_free_pct = 50.0;
-        struct timeval boottime; size_t len = sizeof(boottime);
+        double mem_free_pct = getMemoryFreeFraction() * 100.0;
+        struct timeval bt{};
+        size_t l = sizeof(bt);
         double uptime = 0.0;
-        if (sysctlbyname("kern.boottime",&boottime,&len,nullptr,0)==0) {
+        if (sysctlbyname("kern.boottime",&bt,&l,nullptr,0)==0) {
             auto now = std::chrono::system_clock::now();
-            auto boot = std::chrono::system_clock::from_time_t(boottime.tv_sec);
-            uptime = std::chrono::duration<double>(now - boot).count();
+            auto bo  = std::chrono::system_clock::from_time_t(bt.tv_sec);
+            uptime = std::chrono::duration<double>(now-bo).count();
         }
-        size_t q_len = inbound_.size();
-        double score = computeScore();
 
         nlohmann::json m;
-        m["ts"]           = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch()
-                            ).count();
+        m["ts"]           =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now()
+               .time_since_epoch()
+           ).count();
         m["cpu_free_pct"] = load;
         m["mem_free_pct"] = mem_free_pct;
-        m["queue_length"] = q_len;
         m["uptime_sec"]   = uptime;
-        m["score"]        = score;
+        m["score"]        = computeScore();
 
         {
             std::lock_guard<std::mutex> lk(metrics_mtx_);
-            metrics_file_ << m.dump() << "\n";
+            metrics_file_ << m.dump() << std::endl;
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }

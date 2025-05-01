@@ -14,7 +14,6 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i) {
         neighbors.push_back(argv[i]);
     }
-
     Server srv(node_id, listen_addr, neighbors);
     srv.run();
     return 0;

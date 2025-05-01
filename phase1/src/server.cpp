@@ -330,14 +330,14 @@ void Server::heartbeatLoop() {
         hb.set_from(node_id_);
         hb.set_my_score(score);
 
-        for (auto& [peer_id,entry] : peer_info_) {
-            if (entry.hops <= 3) {
-                auto* pi = hb.add_gossip();
-                pi->set_node_id(peer_id);
-                pi->set_score(entry.score);
-                pi->set_hops(entry.hops);
-            }
-        }
+        // for (auto& [peer_id,entry] : peer_info_) {
+        //     if (entry.hops <= 3) {
+        //         auto* pi = hb.add_gossip();
+        //         pi->set_node_id(peer_id);
+        //         pi->set_score(entry.score);
+        //         pi->set_hops(entry.hops);
+        //     }
+        // }
 
         logger_->log("heartbeat_sent", {
             {"score", score},

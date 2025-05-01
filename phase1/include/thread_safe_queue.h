@@ -38,10 +38,16 @@ public:
         return true;
     }
 
+    // Return the number of items currently queued
+    size_t size() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return q_.size();
+    }
+
 private:
-    std::mutex               mtx_;
-    std::condition_variable  cv_;
-    std::queue<T>            q_;
+    mutable std::mutex        mtx_;  // mutable so size() can lock in const context
+    std::condition_variable   cv_;
+    std::queue<T>             q_;
 };
 
 #endif // THREAD_SAFE_QUEUE_H

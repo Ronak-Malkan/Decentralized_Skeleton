@@ -10,14 +10,13 @@ enum class MessageType {
     TASK_REQUEST
 };
 
-// A generic wrapper that we push into our queue
+// A generic wrapper for incoming gRPC calls.
+// The processor thread inspects `type` to know which field is valid.
 struct Message {
-    MessageType type;
-    std::string from;                       // node ID of sender
-
-    // Only one of these is valid, based on `type`
-    mini3::Heartbeat   heartbeat;
-    mini3::TaskRequest task_request;
+    MessageType           type;
+    std::string           from;           // node ID of sender
+    mini3::Heartbeat      heartbeat;      // valid if type==HEARTBEAT
+    mini3::TaskRequest    task_request;   // valid if type==TASK_REQUEST
 };
 
 #endif // MESSAGE_H

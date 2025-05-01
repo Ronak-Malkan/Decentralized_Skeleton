@@ -5,13 +5,13 @@
 #include <mutex>
 #include <string>
 
-// A single mutex to guard all console output
+// Single mutex for all console output
 inline std::mutex& log_mutex() {
     static std::mutex m;
     return m;
 }
 
-// Thread-safe print: acquires the mutex, writes the entire msg, then flushes
+// Thread-safe print: locks, prints one line, then unlocks
 inline void log_line(const std::string& msg) {
     std::lock_guard<std::mutex> lk(log_mutex());
     std::cout << msg << std::endl;

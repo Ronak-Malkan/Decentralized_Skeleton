@@ -1,53 +1,43 @@
-#ifndef THREAD_SAFE_QUEUE_H
-#define THREAD_SAFE_QUEUE_H
+#ifndef THREADSAFE_QUEUE_H
+#define THREADSAFE_QUEUE_H
 
+#include <queue>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
 
 template<typename T>
 class ThreadSafeQueue {
 public:
-    ThreadSafeQueue() = default;
-    ~ThreadSafeQueue() = default;
+  ThreadSafeQueue() = default;
 
-    // Enqueue an item and notify one waiting thread
-    void push(T item) {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            q_.push(std::move(item));
-        }
-        cv_.notify_one();
+  // push a new element into the queue
+  void push(T value) {
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      q_.push(std::move(value));
     }
+    cond_.notify_one();
+  }
 
-    // Block until there’s an item, then pop and return it
-    T wait_and_pop() {
-        std::unique_lock<std::mutex> lk(mtx_);
-        cv_.wait(lk, [this]{ return !q_.empty(); });
-        T item = std::move(q_.front());
-        q_.pop();
-        return item;
-    }
+  // wait until there’s something and pop it
+  T wait_and_pop() {
+    std::unique_lock<std::mutex> lk(mtx_);
+    cond_.wait(lk, [this]{ return !q_.empty(); });
+    T val = std::move(q_.front());
+    q_.pop();
+    return val;
+  }
 
-    // Try pop without blocking; returns false if empty
-    bool try_pop(T& out) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (q_.empty()) return false;
-        out = std::move(q_.front());
-        q_.pop();
-        return true;
-    }
-
-    // Return the number of items currently queued
-    size_t size() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return q_.size();
-    }
+  // get current size
+  size_t size() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return q_.size();
+  }
 
 private:
-    mutable std::mutex        mtx_;  // mutable so size() can lock in const context
-    std::condition_variable   cv_;
-    std::queue<T>             q_;
+  mutable std::mutex             mtx_;
+  std::queue<T>                  q_;
+  std::condition_variable        cond_;
 };
 
-#endif // THREAD_SAFE_QUEUE_H
+#endif // THREADSAFE_QUEUE_H

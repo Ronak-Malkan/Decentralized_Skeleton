@@ -59,6 +59,7 @@ static double getMemoryFreeFraction() {
 #endif
 }
 
+// Used chatgpt for calculating factors needed for the score, though the score formula itself was defined by our team itself.
 //------------------------------------------------------------------------------
 // Score = 40% CPU-free + 30% queue-depth + 20% mem-free + 10% uptime, plus jitter
 double Server::computeScore() {
@@ -151,7 +152,7 @@ Server::~Server() {
 void Server::run() {
     running_ = true;
     logger_->log("threads_starting");
-
+    //below threads generation and joining was suggested by chatgpt
     t_listener_  = std::thread(&Server::listenerLoop,   this);
     t_processor_ = std::thread(&Server::processorLoop,  this);
     t_heartbeat_ = std::thread(&Server::heartbeatLoop,  this);
@@ -172,7 +173,8 @@ void Server::shutdown() {
 }
 
 //------------------------------------------------------------------------------
-// listenerLoop: synchronous SubmitTask + heartbeats→queue
+// Used chatgpt for below function
+// listenerLoop: synchronous SubmitTask + heartbeats→queue 
 void Server::listenerLoop() {
     logger_->log("thread_started", {{"thread","listener"}});
 
@@ -211,8 +213,18 @@ void Server::listenerLoop() {
                       [](auto &a, auto &b){ return a.second > b.second; });
 
             // Try each candidate in order
+            log_.log("task_candidates", {
+                {"task", req->task_id()},
+                {"candidates", candidates.size()}
+            });
             for (auto& [id,score] : candidates) {
+                log_.log("task_candidate", {
+                    {"task", req->task_id()},
+                    {"peer", id},
+                    {"score", score}
+                });
                 if (id == srv_->node_id_) {
+                    log_.log("task_local", {{"task", req->task_id()}});
                     srv_->processLocalSync(*req, resp);
                     return Status::OK;
                 }
@@ -288,7 +300,7 @@ void Server::processorLoop() {
 void Server::updatePeerInfo(const Heartbeat& hb,
                             const std::string& sender)
 {
-    auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();    
     peer_info_[sender] = PeerEntry{hb.my_score(), sender, 1, now};
     for (auto& pi : hb.gossip()) {
         int nh = pi.hops() + 1;

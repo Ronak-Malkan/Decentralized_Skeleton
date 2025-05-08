@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     std::string node_id     = argv[1];
     std::string listen_addr = argv[2];
     std::vector<std::string> neighbors;
-    for (int i = 3; i < argc; ++i) {
+    for (int i = 2; i < argc; ++i) {
         neighbors.push_back(argv[i]);
     }
     Server srv(node_id, listen_addr, neighbors);
